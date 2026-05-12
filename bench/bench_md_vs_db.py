@@ -35,24 +35,35 @@ MD_FILE = str(_args.md if _args.md else _args.workspace / "IMX8MPRM.md")
 QUERIES = ["HDMI", "GPU", "LCDIF", "I2C", "MIPI", "DMA", "CSI",
            "ECSPI", "VPU", "USB", "SAI", "CAAM", "USDHC", "ENET", "GPT"]
 
-# Same CATEGORIES table as parse_datasheet.py / bench_d_v2.py
-CATEGORIES = {
-    "display": ["lcdif", "hdmi", "mipi dsi", "mipi_dsi", "dsi", "dpu", "pxp", "dcss", "display", "lvds"],
-    "camera":  ["csi", "mipi csi", "mipi_csi", "isp", "isi", "camera"],
-    "audio":   ["sai", "asrc", "pdm", "audmix", "spdif", "mqs", "audio", "i2s"],
-    "security":["caam", "snvs", "ocotp", "hab", "sjc", "trustzone", "security", "rdc", "csu"],
-    "storage": ["usdhc", "qspi", "flexspi", "nand", "emmc", "sdmmc", " sd "],
-    "comm":    ["ecspi", "i2c", "uart", "can", "flexcan", "enet", "eqos", "pcie", "usb", "spi"],
-    "gpu":     ["gpu", "gc7000", "vivante", "gc320", "graphics"],
-    "vpu":     ["vpu", "hantro", "malone", "video", "vc8000"],
-    "timer":   ["gpt", "epit", "pwm", "watchdog", "wdog", "timer"],
-    "dma":     ["sdma", "edma", " dma", "dma "],
-    "power":   ["ccm", "gpc", "src", "anatop", "pmu", "clock", "reset", "power", "ldo", "regulator"],
-    "core":    ["cortex", "gic", "mmu", "a53", "m7", "smmu"],
-    "bus":     ["aips", "axi", "ahb", "noc", "interconnect", "bus"],
-    "mipi":    ["mipi"],
-    "hdmi":    ["hdmi"],
-}
+
+def _load_categories() -> dict:
+    """Load the CATEGORIES dict directly from parse_datasheet.py.
+
+    Avoids the bench falling out of sync with the parser whenever someone
+    re-tunes the keyword groups.
+    """
+    parser_py = Path(__file__).resolve().parents[1] / "parse_datasheet.py"
+    ns: dict = {}
+    src = parser_py.read_text(encoding="utf-8")
+    # Execute only the CATEGORIES literal block to avoid running side-effects.
+    # The dict starts at "CATEGORIES = {" and is balanced by braces.
+    start = src.index("CATEGORIES = {")
+    depth = 0
+    end = start
+    for i in range(start, len(src)):
+        c = src[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    exec(src[start:end], ns)  # noqa: S102 -- trusted local source
+    return ns["CATEGORIES"]
+
+
+CATEGORIES = _load_categories()
 
 
 def grep_count(buf: bytes, pattern: str) -> int:
