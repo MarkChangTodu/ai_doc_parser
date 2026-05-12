@@ -1,18 +1,36 @@
 """Compare search efficiency:
-  Control (DB)   : pre-chunked  ~/zephyrproject/docs/  (Layout D simulation)
-  Experiment (MD): single file  ~/zephyrproject/IMX8MPRM.md  (whole-file grep)
+  Control (DB)   : pre-chunked  <workspace>/docs/                (Layout D simulation)
+  Experiment (MD): single file  <workspace>/IMX8MPRM.md          (whole-file grep)
 
 Same 15 queries as bench_d_v2.py.
 Metric per query: bytes loaded, regex matches, wall-clock ms.
+
+Usage:
+    python3 bench_md_vs_db.py [--workspace <dir>] [--md <md-file>] [--docs <docs-dir>]
+
+Default workspace: 3 levels up from this script.
 """
+import argparse
 import os
 import re
+import sys
 import time
+from pathlib import Path
 
-HOME = os.path.expanduser("~")
-DOCS_DIR = os.path.join(HOME, "zephyrproject", "docs")
+DEFAULT_WORKSPACE = Path(__file__).resolve().parents[3]
+
+_p = argparse.ArgumentParser(description=__doc__)
+_p.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE,
+                help=f"workspace root (default: {DEFAULT_WORKSPACE})")
+_p.add_argument("--docs", type=Path, default=None,
+                help="docs directory (default: <workspace>/docs)")
+_p.add_argument("--md", type=Path, default=None,
+                help="single MD file to grep (default: <workspace>/IMX8MPRM.md)")
+_args = _p.parse_args()
+
+DOCS_DIR = str(_args.docs if _args.docs else _args.workspace / "docs")
 TOPICS_DIR = os.path.join(DOCS_DIR, "topics")
-MD_FILE = os.path.join(HOME, "zephyrproject", "IMX8MPRM.md")
+MD_FILE = str(_args.md if _args.md else _args.workspace / "IMX8MPRM.md")
 
 QUERIES = ["HDMI", "GPU", "LCDIF", "I2C", "MIPI", "DMA", "CSI",
            "ECSPI", "VPU", "USB", "SAI", "CAAM", "USDHC", "ENET", "GPT"]

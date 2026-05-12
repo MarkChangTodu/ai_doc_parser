@@ -1,10 +1,35 @@
-"""Re-benchmark Layout D (optimized, multi-category) vs baseline A."""
-import os, re, time
-from collections import defaultdict
+"""Re-benchmark Layout D (optimized, multi-category) vs baseline A.
 
-BASE_DIR = "/home/markchang/zephyrproject/docs"
+Usage:
+    python3 bench_d_v2.py [--workspace <dir>]
+
+Default workspace: 3 levels up from this script
+    (bench/ -> ai_doc_parser/ -> tools/ -> <workspace>)
+"""
+import argparse
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+DEFAULT_WORKSPACE = Path(__file__).resolve().parents[3]
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE,
+                    help=f"workspace root (default: {DEFAULT_WORKSPACE})")
+parser.add_argument("--docs", type=Path, default=None,
+                    help="docs/ directory (default: <workspace>/docs)")
+args = parser.parse_args()
+
+BASE_DIR = str(args.docs if args.docs else args.workspace / "docs")
 A_PATH = os.path.join(BASE_DIR, "subsystems_index.md")  # short chapter-only version now
 TOPICS_DIR = os.path.join(BASE_DIR, "topics")
+
+if not os.path.isdir(TOPICS_DIR):
+    sys.exit(f"[error] topics dir not found: {TOPICS_DIR}")
+print(f"[info] using docs: {BASE_DIR}")
 
 # Same query set as before
 QUERIES = ["HDMI", "GPU", "LCDIF", "I2C", "MIPI", "DMA", "CSI",

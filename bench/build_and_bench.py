@@ -22,13 +22,26 @@ Agent simulation per layout:
      (if no hit in main, fall back to scanning all)
 """
 import os
+import argparse
 import re
 import time
 import json
 from collections import defaultdict
+from pathlib import Path
 
-INPUT_FILE = "/home/markchang/zephyrproject/IMX8MPRM.txt"
-BASE_DIR = "/home/markchang/zephyrproject/docs"
+DEFAULT_WORKSPACE = Path(__file__).resolve().parents[3]
+
+_p = argparse.ArgumentParser(description="Build B/C/D index layouts and benchmark.")
+_p.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE,
+                help=f"workspace root (default: {DEFAULT_WORKSPACE})")
+_p.add_argument("--input", type=Path, default=None,
+                help="datasheet TXT input (default: <workspace>/IMX8MPRM.txt)")
+_p.add_argument("--docs", type=Path, default=None,
+                help="docs directory (default: <workspace>/docs)")
+_args = _p.parse_args()
+
+INPUT_FILE = str(_args.input if _args.input else _args.workspace / "IMX8MPRM.txt")
+BASE_DIR = str(_args.docs if _args.docs else _args.workspace / "docs")
 
 A_PATH = os.path.join(BASE_DIR, "subsystems_index.md")
 B_DIR = os.path.join(BASE_DIR, "idx_b")
@@ -70,7 +83,7 @@ def get_level(section):
 
 
 def parse_sections():
-    print("[parse] reading IMX8MPRM.txt ...")
+    print(f"[parse] reading {INPUT_FILE} ...")
     with open(INPUT_FILE, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 

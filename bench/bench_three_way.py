@@ -1,20 +1,33 @@
 """Three-way comparison:
-  baseline_db : pre-existing  ~/zephyrproject/docs/  (old CATEGORIES with fat 'comm')
-  txt_v2_db   : re-parsed     ~/zephyrproject/docs_txt_v2/  (new split CATEGORIES)
-  md_db       : MD re-parsed  ~/zephyrproject/docs_md/      (new split CATEGORIES)
+  baseline_db : pre-existing  <workspace>/docs_txt_v1/  (old CATEGORIES with fat 'comm')
+  txt_v2_db   : re-parsed     <workspace>/docs_txt_v2/  (new split CATEGORIES)
+  md_db       : MD re-parsed  <workspace>/docs_md/      (new split CATEGORIES)
 
 Single MD file is also kept as a reference upper bound.
 
 Usage:
-  python3 bench_three_way.py
+    python3 bench_three_way.py [--workspace <dir>] [--md <md-file>]
+
+Default workspace: 3 levels up from this script.
 """
+import argparse
 import os
 import re
 import sys
 import time
+from pathlib import Path
 
-HOME = os.path.expanduser("~")
-MD_FILE = os.path.join(HOME, "zephyrproject", "IMX8MPRM.md")
+DEFAULT_WORKSPACE = Path(__file__).resolve().parents[3]
+
+_p = argparse.ArgumentParser(description=__doc__)
+_p.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE,
+                help=f"workspace root (default: {DEFAULT_WORKSPACE})")
+_p.add_argument("--md", type=Path, default=None,
+                help="single MD file to grep (default: <workspace>/IMX8MPRM.md)")
+_args = _p.parse_args()
+
+WORKSPACE = _args.workspace
+MD_FILE = str(_args.md if _args.md else WORKSPACE / "IMX8MPRM.md")
 
 QUERIES = ["HDMI", "GPU", "LCDIF", "I2C", "MIPI", "DMA", "CSI",
            "ECSPI", "VPU", "USB", "SAI", "CAAM", "USDHC", "ENET", "GPT"]
@@ -165,21 +178,21 @@ def run_md_pass() -> dict:
 
 
 def main():
-    base = os.path.join(HOME, "zephyrproject")
+    base = WORKSPACE
     results = {}
     results["baseline_db (txt, old CATEGORIES)"] = run_pass(
         "baseline_db (txt, old CATEGORIES)",
-        os.path.join(base, "docs_txt_v1"),
+        str(base / "docs_txt_v1"),
         CATEGORIES_OLD,
     )
     results["txt_v2_db (txt, split comm)"] = run_pass(
         "txt_v2_db (txt, split comm)",
-        os.path.join(base, "docs_txt_v2"),
+        str(base / "docs_txt_v2"),
         CATEGORIES_NEW,
     )
     results["md_db (markitdown md, split comm)"] = run_pass(
         "md_db (markitdown md, split comm)",
-        os.path.join(base, "docs_md"),
+        str(base / "docs_md"),
         CATEGORIES_NEW,
     )
     results["single MD file"] = run_md_pass()
