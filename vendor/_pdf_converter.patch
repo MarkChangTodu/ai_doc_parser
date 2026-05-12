@@ -1,5 +1,16 @@
---- /tmp/_pdf_converter_upstream.py	2026-05-12 16:07:57.625847562 +0800
-+++ /home/markchang/markitdown/markitdown-main/packages/markitdown/src/markitdown/converters/_pdf_converter.py	2026-05-12 14:07:05.928323310 +0800
+# markitdown _pdf_converter.py local patch
+#
+# Base: microsoft/markitdown @ a51f725d7ff4  (>= v0.1.6b2, includes PR #1612)
+# Adds on top of upstream:
+#   - SpooledTemporaryFile(max_size=10 MiB) instead of in-RAM BytesIO
+#     -> avoids holding 1-2x the PDF size in memory (WSL OOM on 40+ MB datasheets).
+#   - _make_progress() helper -> tqdm/stdlib/no-op progress bar over pdfplumber pages.
+#
+# Apply with:  patch -p1 < vendor/_pdf_converter.patch
+# (paths below are relative to packages/markitdown/src/markitdown/converters/)
+
+--- a/_pdf_converter.py
++++ b/_pdf_converter.py
 @@ -1,12 +1,64 @@
  import sys
  import io
