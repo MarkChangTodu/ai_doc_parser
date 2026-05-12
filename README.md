@@ -1,6 +1,10 @@
-# parse_datasheet.py — 使用說明
+# ai_doc_parser — 使用說明
 
-將 SoC 規格書 (PDF/TXT) 自動切割成可被 GitHub Copilot 高效率檢索的結構化 Markdown 知識庫，並產生規則檔讓 Copilot 在本 workspace 中自動遵循「不猜測、只引用 `docs/`」的工作流程。
+將 SoC 規格書 (PDF / MD / TXT) 自動切割成可被 GitHub Copilot 高效率檢索的結構化 Markdown 知識庫，並產生規則檔讓 Copilot 在本 workspace 中自動遵循「不猜測、只引用 `docs/`」的工作流程。
+
+> **新流程 (推薦)**：`PDF -> markitdown.md -> docs/{topics,subsystems,registers,misc}/*.md`，
+> 並保留原始 `.md` 在 `docs/source/` 當 catch-all fallback。
+> 使用 vendored markitdown（含 spool + progress 補丁，見 `vendor/_pdf_converter.patch`）。
 
 ---
 
@@ -8,7 +12,8 @@
 
 | 功能 | 輸出位置 |
 |---|---|
-| PDF → TXT 轉換 (有快取) | 與 PDF 同目錄的 `<同名>.txt` |
+| PDF → MD 轉換 (vendored markitdown, 有快取) | `docs/source/<stem>.md` |
+| MD 採用（已有 .md 直接餵） | 複製到 `docs/source/<stem>.md` |
 | 子系統 spec 切割 | `docs/subsystems/*.md` |
 | Register 區塊抽取 | `docs/registers/*.md` |
 | 其他段落 | `docs/misc/*.md` |
@@ -17,6 +22,11 @@
 | 主題分類索引 (display / camera / dma / ...) | `docs/topics/<topic>.md` |
 | Driver 查詢模板 | `docs/driver_prompt.md` |
 | **Copilot 自動規則檔** | `.github/copilot-instructions.md` |
+| **Source marker (給 fallback 用)** | `docs/.source` |
+| **Catch-all fallback helper** | `fallback/lookup.py` |
+| **Markitdown vendored copy** | `vendor/markitdown/` (+ `vendor/_pdf_converter.patch`) |
+| **End-to-end pipeline** | `pipeline.sh` |
+| **Bench scripts** | `bench/*.py` |
 
 ---
 
@@ -24,41 +34,64 @@
 
 | 項目 | 必要性 | 安裝方式 |
 |---|---|---|
-| Python 3.8+ | 必要 | 系統內建或 `apt install python3` |
-| `pdftotext` (poppler) | 推薦 | `sudo apt install poppler-utils` |
-| `pypdf` (Python fallback) | 可選 | `pip install pypdf` |
+| Python 3.10+ | 必要（vendored markitdown 需要） | 系統內建或 `apt install python3` |
+| `pdfminer.six >= 20251230` | PDF 必要 | `pip install pdfminer.six` |
+| `pdfplumber >= 0.11.9` | PDF 必要 | `pip install pdfplumber` |
+| `magika ~= 0.6.1` | PDF 必要 | `pip install magika` |
+| `tqdm` | 可選 (進度條) | `pip install tqdm` |
+| `pdftotext` (poppler) | 可選 (僅供 .txt 流程) | `sudo apt install poppler-utils` |
 
-> **PDF backend 選用順序：** 先試 `pdftotext -layout`，失敗才退回 `pypdf`。`pdftotext` 排版保留度較好，強烈推薦安裝。
+> **PDF 處理 backend 順序**：`.pdf` 走 vendored markitdown（spool + progress patch，
+> 大檔不爆 RAM）；只在輸入是 `.txt` 時才退回 pdftotext。
 
 ---
 
 ## 3. 使用方式
 
-### 3.1 直接餵 PDF（推薦）
+### 3.1 一條指令跑完（推薦）
 
 ```bash
-python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.pdf
+./tools/ai_doc_parser/pipeline.sh IMX8MPRM.pdf
+# 或
+./tools/ai_doc_parser/pipeline.sh IMX8MPRM.md
 ```
 
-執行流程：
-1. 把 `IMX8MPRM.pdf` 轉成 `IMX8MPRM.txt`（若 TXT 已存在且比 PDF 新則使用快取）
-2. 解析 TXT，產生 `docs/` 與 `.github/copilot-instructions.md`
+流程：
+1. `.pdf` → vendored markitdown → `docs/source/IMX8MPRM.md` (mtime cache)
+2. 切割 → `docs/{subsystems,registers,misc,topics}/*.md`
+3. 寫 `docs/.source`、`.github/copilot-instructions.md`（含 fallback 段）
+4. 跑 `bench/bench_md_vs_db.py` 顯示效率對照
 
-### 3.2 餵已轉好的 TXT
+> 要跳過 bench：`AI_DOC_NO_BENCH=1 ./pipeline.sh IMX8MPRM.pdf`
+
+### 3.2 直接呼叫 parser
 
 ```bash
-python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.txt
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.pdf   # PDF
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md    # 已切好的 MD
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.txt   # 舊流程相容
 ```
 
-跳過轉換，直接解析。
-
-### 3.3 不帶參數（使用預設）
+### 3.3 只做 PDF → MD（不切割）
 
 ```bash
-python3 tools/ai_doc_parser/parse_datasheet.py
+python3 tools/ai_doc_parser/convert/pdf_to_md.py IMX8MPRM.pdf --out docs/source/IMX8MPRM.md
 ```
 
-使用程式碼裡的 `DEFAULT_INPUT = "/home/markchang/zephyrproject/IMX8MPRM.txt"`。
+### 3.4 Fallback lookup（給 LLM agent 或人工用）
+
+```bash
+# grep 找關鍵字（最多 50 行）
+python3 tools/ai_doc_parser/fallback/lookup.py grep "I2C clock"
+
+# 讀某行附近的 ±N 行（預設 -20 / +100）
+python3 tools/ai_doc_parser/fallback/lookup.py window 12345
+
+# 看原始 .md 路徑、大小、行數
+python3 tools/ai_doc_parser/fallback/lookup.py info
+```
+
+來源 .md 的解析順序：`--md` → `AI_DOC_SOURCE_MD` 環境變數 → `docs/.source` → `docs/source/*.md`。
 
 ---
 
@@ -67,12 +100,14 @@ python3 tools/ai_doc_parser/parse_datasheet.py
 ```
 zephyrproject/
 ├── IMX8MPRM.pdf              # 原始輸入
-├── IMX8MPRM.txt              # 自動轉出的快取
 ├── .github/
 │   └── copilot-instructions.md   # Copilot 自動載入的規則
 └── docs/
+    ├── .source                   # 原始 .md 絕對路徑 (fallback/lookup.py 讀)
     ├── driver_prompt.md          # 查詢模板
     ├── subsystems_index.md       # Chapter-level fallback 索引
+    ├── source/
+    │   └── IMX8MPRM.md           # markitdown 轉出的原文 (catch-all fallback 來源)
     ├── topics/
     │   ├── main.md               # ★ Topic dispatcher (Copilot 先讀這個)
     │   ├── display.md

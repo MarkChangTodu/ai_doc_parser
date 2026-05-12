@@ -1,7 +1,11 @@
 import os
 import re
 import sys
+import shutil
 import subprocess
+
+# Make convert/ importable so we can reuse pdf_to_md.convert_pdf().
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Workspace root is two levels above this script:
 #   <workspace>/tools/ai_doc_parser/parse_datasheet.py
@@ -16,6 +20,8 @@ BASE_DIR = os.path.join(WORKSPACE_DIR, "docs")
 SUB_DIR = os.path.join(BASE_DIR, "subsystems")
 REG_DIR = os.path.join(BASE_DIR, "registers")
 MISC_DIR = os.path.join(BASE_DIR, "misc")
+SRC_DIR = os.path.join(BASE_DIR, "source")
+SOURCE_MARKER = os.path.join(BASE_DIR, ".source")
 COPILOT_INSTRUCTIONS_PATH = os.path.join(WORKSPACE_DIR, ".github", "copilot-instructions.md")
 
 ALIAS = {
@@ -130,15 +136,51 @@ def pdf_to_txt(pdf_path):
     return txt_path
 
 def resolve_input(arg):
-    """Accept a .pdf or .txt path; return a .txt path ready to parse."""
+    """Accept a .pdf, .md or .txt path; return a text path ready to parse.
+
+    For .pdf: converts via the vendored markitdown and stores the result in
+    ``docs/source/<stem>.md`` (single source of truth, mtime-cached).
+    For .md : copies into ``docs/source/<stem>.md`` so all data lives in one
+    place; subsequent runs are mtime-cached.
+    For .txt: kept for backwards compatibility (uses pdftotext output).
+    """
     if not os.path.exists(arg):
         raise SystemExit(f"❌ Input not found: {arg}")
     ext = os.path.splitext(arg)[1].lower()
     if ext == ".pdf":
-        return pdf_to_txt(arg)
+        return pdf_to_md(arg)
+    if ext == ".md":
+        return adopt_md(arg)
     if ext == ".txt":
         return arg
-    raise SystemExit(f"❌ Unsupported file type: {arg} (expect .pdf or .txt)")
+    raise SystemExit(f"❌ Unsupported file type: {arg} (expect .pdf, .md or .txt)")
+
+
+def pdf_to_md(pdf_path):
+    """Convert PDF -> Markdown via vendored markitdown, output under docs/source/."""
+    from convert.pdf_to_md import convert_pdf  # local import: avoids needing markitdown deps for txt-only flow
+
+    os.makedirs(SRC_DIR, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+    out = os.path.join(SRC_DIR, stem + ".md")
+    md_path = convert_pdf(pdf_path, out_path=out)
+    print(f"✅ Markdown ready: {md_path}")
+    return str(md_path)
+
+
+def adopt_md(md_path):
+    """Copy a pre-existing .md into docs/source/ (mtime-cached) and return its path."""
+    os.makedirs(SRC_DIR, exist_ok=True)
+    src = os.path.abspath(md_path)
+    dst = os.path.join(SRC_DIR, os.path.basename(src))
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return dst  # already in place
+    if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+        print(f"✅ Using cached MD: {dst}")
+        return dst
+    shutil.copy2(src, dst)
+    print(f"✅ Copied {src} -> {dst}")
+    return dst
 
 # ---------- 主解析 ----------
 def parse_and_extract():
@@ -240,6 +282,7 @@ def parse_and_extract():
     create_index(sections)
     create_topic_index(sections)
     create_driver_prompt()
+    write_source_marker()
     create_copilot_instructions()
 
     print(f"✅ Extracted {reg_count} register blocks")
@@ -357,54 +400,109 @@ Rules:
 
     print("✅ driver_prompt.md created")
 
+# ---------- source marker (for fallback/lookup.py) ----------
+def write_source_marker():
+    """Record the absolute path of the source .md so fallback/lookup.py can find it.
+
+    Only written when the input is a markdown file in docs/source/. For .txt
+    inputs the marker is skipped (lookup helper falls back to other resolution).
+    """
+    if not INPUT_FILE.lower().endswith(".md"):
+        return
+    os.makedirs(BASE_DIR, exist_ok=True)
+    with open(SOURCE_MARKER, "w", encoding="utf-8") as f:
+        f.write(os.path.abspath(INPUT_FILE) + "\n")
+    print(f"✅ source marker: {SOURCE_MARKER}")
+
+
 # ---------- ✅ copilot-instructions 自動建立 ----------
 def create_copilot_instructions():
     os.makedirs(os.path.dirname(COPILOT_INSTRUCTIONS_PATH), exist_ok=True)
 
-    with open(COPILOT_INSTRUCTIONS_PATH, "w", encoding="utf-8") as f:
-        f.write("""# Copilot Instructions for IMX8MP Driver Development
+    src_rel = os.path.relpath(INPUT_FILE, WORKSPACE_DIR) if INPUT_FILE else "docs/source/<datasheet>.md"
+    has_md_source = INPUT_FILE.lower().endswith(".md")
+
+    fallback_section = ""
+    if has_md_source:
+        fallback_section = f"""
+## Fallback (when `docs/` does NOT contain the answer)
+
+The original Markdown source is preserved at `{src_rel}`. **NEVER read it as a
+whole** (it can be tens of MB). Instead, use the helper script that does
+targeted line-number lookups:
+
+```bash
+# 1. Find candidate line numbers for a keyword (default: <=50 results, case-insensitive)
+python3 tools/ai_doc_parser/fallback/lookup.py grep "<keyword>"
+
+# 2. Read a window of lines around a chosen line
+python3 tools/ai_doc_parser/fallback/lookup.py window <line> --before 20 --after 100
+
+# 3. (Optional) inspect file size / line count
+python3 tools/ai_doc_parser/fallback/lookup.py info
+```
+
+Fallback rules:
+- Use fallback **only** when `docs/topics/`, `docs/subsystems/`, `docs/registers/`
+  and `docs/misc/` together cannot answer.
+- After looking up a window, cite the source as `{src_rel}:L<start>-L<end>`.
+- Still respect: do NOT guess, do NOT use general i.MX8MP knowledge.
+"""
+
+    content = f"""# Copilot Instructions for IMX8MP Driver Development
 
 These instructions apply to all driver/firmware tasks in this workspace.
+They were generated by `tools/ai_doc_parser/parse_datasheet.py`.
 
-## Source of Truth
-- Use ONLY information from the `docs/` folder (parsed from IMX8MPRM.txt).
-- **Topic dispatcher (use FIRST):** `docs/topics/main.md`
-- Per-topic indexes: `docs/topics/<topic>.md`
-- Chapter-level fallback index: `docs/subsystems_index.md`
-- Subsystem specs: `docs/subsystems/*.md`
-- Register details: `docs/registers/*.md`
-- Misc specs: `docs/misc/*.md`
+## Source of Truth (in priority order)
+1. `docs/topics/main.md`            -- topic dispatcher (open FIRST)
+2. `docs/topics/<topic>.md`         -- per-topic candidate lists
+3. `docs/subsystems/*.md`           -- per-subsystem specifications
+4. `docs/registers/*.md`            -- register field tables
+5. `docs/misc/*.md`                 -- everything else that survived parsing
+6. `docs/subsystems_index.md`       -- chapter-level fallback index
+7. `{src_rel}` via `fallback/lookup.py` -- catch-all for what `docs/` missed
 
-## Rules
+## Hard Rules
 - Do NOT guess.
-- Do NOT use external/general knowledge of i.MX8MP that is not present in `docs/`.
-- Do NOT read `IMX8MPRM.txt` directly; always use the parsed files under `docs/`.
-- If something is not in the spec, say exactly: "not in spec".
-- Always cite the source file (e.g. `docs/subsystems/hdmi.md`) when stating a fact.
+- Do NOT use external / general knowledge of i.MX8MP that is not present in
+  the workspace files listed above.
+- Do NOT read the raw source `.md` (or any `.txt`) wholesale; use the
+  fallback helper for targeted lookups (see section below).
+- If a fact is not in any of the listed sources, answer **exactly**:
+  `not in spec`.
+- Always cite the source file (e.g. `docs/subsystems/hdmi.md` or
+  `{src_rel}:L1234-L1334`) when stating a fact.
 
 ## Default Workflow for Driver Tasks
-1. Open `docs/topics/main.md` and match the query against topic keyword lists.
-   A query may match MULTIPLE topics (e.g. "MIPI" -> display + camera + mipi).
-2. Open all matching `docs/topics/<topic>.md` to find candidate subsystem files.
-3. Read the matching `docs/subsystems/*.md` file(s).
-4. Pull related registers from `docs/registers/*.md`.
-5. Provide a step-by-step initialization flow.
-
+1. Open `docs/topics/main.md`; match the query keyword(s) against the topic
+   keyword lists. A query may map to MULTIPLE topics (e.g. "MIPI" -> display
+   + camera + mipi).
+2. Open every matching `docs/topics/<topic>.md` to enumerate candidate
+   subsystem files.
+3. Open the matching `docs/subsystems/*.md` file(s).
+4. Pull related register details from `docs/registers/*.md`.
+5. If steps 1-4 leave gaps, use **Fallback** (below).
+6. Produce a step-by-step initialization flow in the required output format.
+{fallback_section}
 ## Required Output Format
 
 ### Subsystem
 (Name)
 
 ### Key Registers
-(List with offset + bit fields, cite source file)
+(List with offset + bit fields. Cite source file for each row.)
 
 ### Initialization Steps
 1. Step 1 (cite source)
 2. Step 2 (cite source)
 
 ### Notes
-- Mark anything not in spec.
-""")
+- Mark anything not in spec as `not in spec`.
+"""
+
+    with open(COPILOT_INSTRUCTIONS_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
 
     print(f"✅ {COPILOT_INSTRUCTIONS_PATH} created")
 

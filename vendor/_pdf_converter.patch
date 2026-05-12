@@ -1,0 +1,183 @@
+--- /tmp/_pdf_converter_upstream.py	2026-05-12 16:07:57.625847562 +0800
++++ /home/markchang/markitdown/markitdown-main/packages/markitdown/src/markitdown/converters/_pdf_converter.py	2026-05-12 14:07:05.928323310 +0800
+@@ -1,12 +1,64 @@
+ import sys
+ import io
+ import re
+-from typing import BinaryIO, Any
++import tempfile
++from typing import BinaryIO, Any, Callable
+ 
+ from .._base_converter import DocumentConverter, DocumentConverterResult
+ from .._stream_info import StreamInfo
+ from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+ 
++# Threshold above which the input PDF stream is spilled to a temp file on disk
++# instead of being held in a BytesIO. This avoids holding 1-2x the file size in
++# RAM for large PDFs (which on WSL can trigger OOM / host freezes).
++_SPOOL_MAX_SIZE = 10 * 1024 * 1024  # 10 MiB
++
++
++def _make_progress(total: int, desc: str = "Converting PDF") -> Callable[[int], None]:
++    """Return a callable ``update(current)`` that renders a page-level progress bar.
++
++    - Uses ``tqdm`` when available.
++    - Falls back to a simple ``\r``-based line on stderr when stderr is a TTY.
++    - Becomes a no-op when stderr is not a TTY (so library / pipeline use stays clean).
++
++    The returned callable has a ``.close()`` method to finalize the bar.
++    """
++    # No-op when not interactive
++    if not getattr(sys.stderr, "isatty", lambda: False)():
++        def _noop(current: int) -> None:
++            return None
++
++        _noop.close = lambda: None  # type: ignore[attr-defined]
++        return _noop  # type: ignore[return-value]
++
++    try:
++        from tqdm import tqdm  # type: ignore
++
++        bar = tqdm(total=total, desc=desc, unit="page", file=sys.stderr, leave=False)
++
++        def _update(current: int) -> None:
++            delta = current - bar.n
++            if delta > 0:
++                bar.update(delta)
++
++        _update.close = bar.close  # type: ignore[attr-defined]
++        return _update  # type: ignore[return-value]
++    except ImportError:
++        pass
++
++    # Stdlib fallback
++    def _update(current: int) -> None:
++        pct = (current * 100 // total) if total else 100
++        sys.stderr.write(f"\r{desc}: {current}/{total} ({pct}%)")
++        sys.stderr.flush()
++
++    def _close() -> None:
++        sys.stderr.write("\n")
++        sys.stderr.flush()
++
++    _update.close = _close  # type: ignore[attr-defined]
++    return _update  # type: ignore[return-value]
++
+ # Pattern for MasterFormat-style partial numbering (e.g., ".1", ".2", ".10")
+ PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
+ 
+@@ -536,52 +588,70 @@
+ 
+         assert isinstance(file_stream, io.IOBase)
+ 
+-        # Read file stream into BytesIO for compatibility with pdfplumber
+-        pdf_bytes = io.BytesIO(file_stream.read())
+-
++        # Spool the input to disk if it exceeds _SPOOL_MAX_SIZE. Small PDFs stay
++        # in RAM (fast path), large PDFs are streamed to a temp file so that
++        # pdfplumber / pdfminer can mmap-style read pages on demand instead of
++        # forcing us to hold the whole file (and a copy of it) in memory.
++        pdf_buffer = tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_SIZE)
+         try:
+-            # Single pass: check every page for form-style content.
+-            # Pages with tables/forms get rich extraction; plain-text
+-            # pages are collected separately. page.close() is called
+-            # after each page to free pdfplumber's cached objects and
+-            # keep memory usage constant regardless of page count.
+-            markdown_chunks: list[str] = []
+-            form_page_count = 0
+-            plain_page_indices: list[int] = []
+-
+-            with pdfplumber.open(pdf_bytes) as pdf:
+-                for page_idx, page in enumerate(pdf.pages):
+-                    page_content = _extract_form_content_from_words(page)
+-
+-                    if page_content is not None:
+-                        form_page_count += 1
+-                        if page_content.strip():
+-                            markdown_chunks.append(page_content)
+-                    else:
+-                        plain_page_indices.append(page_idx)
+-                        text = page.extract_text()
+-                        if text and text.strip():
+-                            markdown_chunks.append(text.strip())
+-
+-                    page.close()  # Free cached page data immediately
+-
+-            # If no pages had form-style content, use pdfminer for
+-            # the whole document (better text spacing for prose).
+-            if form_page_count == 0:
+-                pdf_bytes.seek(0)
+-                markdown = pdfminer.high_level.extract_text(pdf_bytes)
+-            else:
+-                markdown = "\n\n".join(markdown_chunks).strip()
++            while True:
++                chunk = file_stream.read(1024 * 1024)
++                if not chunk:
++                    break
++                pdf_buffer.write(chunk)
++            pdf_buffer.seek(0)
+ 
+-        except Exception:
+-            # Fallback if pdfplumber fails
+-            pdf_bytes.seek(0)
+-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
+-
+-        # Fallback if still empty
+-        if not markdown:
+-            pdf_bytes.seek(0)
+-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
++            try:
++                # Single pass: check every page for form-style content.
++                # Pages with tables/forms get rich extraction; plain-text
++                # pages are collected separately. page.close() is called
++                # after each page to free pdfplumber's cached objects and
++                # keep memory usage constant regardless of page count.
++                markdown_chunks: list[str] = []
++                form_page_count = 0
++                plain_page_indices: list[int] = []
++
++                with pdfplumber.open(pdf_buffer) as pdf:
++                    total_pages = len(pdf.pages)
++                    progress = _make_progress(total_pages)
++                    try:
++                        for page_idx, page in enumerate(pdf.pages):
++                            page_content = _extract_form_content_from_words(page)
++
++                            if page_content is not None:
++                                form_page_count += 1
++                                if page_content.strip():
++                                    markdown_chunks.append(page_content)
++                            else:
++                                plain_page_indices.append(page_idx)
++                                text = page.extract_text()
++                                if text and text.strip():
++                                    markdown_chunks.append(text.strip())
++
++                            page.close()  # Free cached page data immediately
++                            progress(page_idx + 1)
++                    finally:
++                        progress.close()
++
++                # If no pages had form-style content, use pdfminer for
++                # the whole document (better text spacing for prose).
++                if form_page_count == 0:
++                    pdf_buffer.seek(0)
++                    markdown = pdfminer.high_level.extract_text(pdf_buffer)
++                else:
++                    markdown = "\n\n".join(markdown_chunks).strip()
++
++            except Exception:
++                # Fallback if pdfplumber fails
++                pdf_buffer.seek(0)
++                markdown = pdfminer.high_level.extract_text(pdf_buffer)
++
++            # Fallback if still empty
++            if not markdown:
++                pdf_buffer.seek(0)
++                markdown = pdfminer.high_level.extract_text(pdf_buffer)
++        finally:
++            pdf_buffer.close()
+ 
+         # Post-process to merge MasterFormat-style partial numbering with following text
+         markdown = _merge_partial_numbering_lines(markdown)
