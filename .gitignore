@@ -1,20 +1,6 @@
-# Byte-compiled / optimized
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual envs
+*.pyc
+*.pyo
 .venv/
-venv/
-env/
-
-# OS / editor
-.DS_Store
 .vscode/
-.idea/
-*.swp
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
+.DS_Store
