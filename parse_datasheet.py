@@ -23,6 +23,7 @@ MISC_DIR = os.path.join(BASE_DIR, "misc")
 SRC_DIR = os.path.join(BASE_DIR, "source")
 SOURCE_MARKER = os.path.join(BASE_DIR, ".source")
 COPILOT_INSTRUCTIONS_PATH = os.path.join(WORKSPACE_DIR, ".github", "copilot-instructions.md")
+CURSOR_RULES_PATH = os.path.join(WORKSPACE_DIR, ".cursor", "rules", "imx8mp-driver.mdc")
 
 ALIAS = {
     "graphics processing unit": "gpu",
@@ -533,6 +534,19 @@ figures speculatively.
         f.write(content)
 
     print(f"✅ {COPILOT_INSTRUCTIONS_PATH} created")
+
+    # Also emit a Cursor rule file so Cursor users get the same rules.
+    # Cursor reads `.cursor/rules/*.mdc` with optional YAML frontmatter.
+    os.makedirs(os.path.dirname(CURSOR_RULES_PATH), exist_ok=True)
+    cursor_frontmatter = (
+        "---\n"
+        "description: IMX8MP driver development rules (auto-generated)\n"
+        "alwaysApply: true\n"
+        "---\n\n"
+    )
+    with open(CURSOR_RULES_PATH, "w", encoding="utf-8") as f:
+        f.write(cursor_frontmatter + content)
+    print(f"✅ {CURSOR_RULES_PATH} created")
 
 # ---------- ✅ SEARCH_RULES.md (human-readable mirror of the rules) ----------
 def create_search_rules_doc():
