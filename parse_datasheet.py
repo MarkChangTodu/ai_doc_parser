@@ -17,6 +17,11 @@ DEFAULT_INPUT = os.path.join(WORKSPACE_DIR, "IMX8MPRM.txt")
 INPUT_FILE = DEFAULT_INPUT
 BASE_DIR = os.path.join(WORKSPACE_DIR, "docs")
 
+# ---------- Runtime flags (set by argparse in __main__) ----------
+DRY_RUN = False          # True -> do not write any output file; print summary only
+SECTION_FILTER = None    # e.g. "13.11" -> only emit sections whose number starts with this
+LINE_RANGE = None        # (L_start, L_end) 1-based inclusive; only parse this slice of input
+
 SUB_DIR = os.path.join(BASE_DIR, "subsystems")
 REG_DIR = os.path.join(BASE_DIR, "registers")
 MISC_DIR = os.path.join(BASE_DIR, "misc")
@@ -86,6 +91,62 @@ def is_register_block(text):
         "register" in t and
         ("bit" in t or "field" in t or "offset" in t)
     )
+
+# ---------- Section validation (T1-1) ----------
+# Known running-header / footer artifacts that look like section titles but aren't.
+NOISE_TITLES = {
+    "nxp semiconductors",
+    "display, imaging, and camera",
+    "applications processor reference manual",
+}
+
+# Match a TOC-entry trailing artifact like ".............5538" or "   .   .   .   5538".
+TOC_DOTS_RE = re.compile(r'[\.\s]{3,}\d+\s*$')
+
+def strip_toc_dots(title):
+    """Strip the trailing '..........<page>' that TOC lines carry so the title
+    of a TOC entry matches the title of the real heading."""
+    return TOC_DOTS_RE.sub('', title).strip()
+
+
+def is_real_section_number(section):
+    """A real section number has at least one dot, only digits between dots,
+    chapter index 1..99, depth <=6 (some NXP sub-registers go 6 levels)."""
+    if "." not in section:
+        return False
+    parts = section.split(".")
+    if not all(p.isdigit() and p for p in parts):
+        return False
+    if len(parts) > 6:
+        return False
+    head = int(parts[0])
+    if head < 1 or head > 99:
+        return False
+    return True
+
+
+def is_real_section_title(title):
+    """Reject obvious non-titles: empty, mostly digits, known running headers,
+    or starts with a lowercase letter (real headings are Title Case / UPPER)."""
+    if not title:
+        return False
+    t = title.strip()
+    if len(t) < 4:
+        return False
+    tl = t.lower()
+    if tl in NOISE_TITLES:
+        return False
+    if "reference manual" in tl and "i.mx" in tl:
+        return False
+    # Too many digits = it's a table row or footer (e.g. "858 Total Pixels")
+    digits = sum(c.isdigit() for c in t)
+    if digits * 2 > len(t):
+        return False
+    # First alphabetic character must be uppercase (NXP headings are Title Case)
+    first_alpha = next((c for c in t if c.isalpha()), None)
+    if first_alpha is None or not first_alpha.isupper():
+        return False
+    return True
 
 # ---------- PDF → TXT 轉換 ----------
 def pdf_to_txt(pdf_path):
@@ -192,72 +253,178 @@ def parse_and_extract():
         return
 
     with open(INPUT_FILE, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
+        all_lines = f.readlines()
 
-    print(f"✅ Total lines: {len(lines)}")
+    # --range L_start L_end : only parse this 1-based inclusive slice.
+    # `line_offset` is the absolute line number of lines[0] (1-based).
+    if LINE_RANGE is not None:
+        l0, l1 = LINE_RANGE
+        l0 = max(1, l0)
+        l1 = min(len(all_lines), l1)
+        lines = all_lines[l0 - 1:l1]
+        line_offset = l0
+        print(f"✅ Range mode: lines {l0}-{l1} of {len(all_lines)} ({len(lines)} lines)")
+    else:
+        lines = all_lines
+        line_offset = 1
+        print(f"✅ Total lines: {len(lines)}")
 
     sections = []
     i = 0
 
-    # ✅ section parsing
+    # ✅ section parsing (T1-1: tightened)
+    # We accept three patterns, all gated by is_real_section_*() validators:
+    #   (a) "Chapter N Title"
+    #   (b) "N.M[.K...] Title on same line"
+    #   (c) "N.M[.K...]" alone on a line followed by a Title on the next line
     while i < len(lines):
         line = lines[i].strip()
 
-        match = re.match(r'^\s*Chapter\s+(\d+)\s+(.+)', line, re.IGNORECASE)
-        if match:
-            sections.append((match.group(1), match.group(2).strip(), i))
+        # (a) Chapter heading
+        m = re.match(r'^\s*Chapter\s+(\d+)\s+(.+)', line, re.IGNORECASE)
+        if m:
+            title = strip_toc_dots(m.group(2).strip())
+            if is_real_section_title(title):
+                sections.append((m.group(1), title, i))
             i += 1
             continue
 
-        match = re.match(r'^\s*(\d+(\.\d+)?)$', line)
-        if match and i + 1 < len(lines):
-            next_line = lines[i + 1].strip()
-            if len(next_line) > 5:
-                sections.append((match.group(1), next_line, i))
+        # (b) "N.M[.K...] Title"  -- requires at least one dot in number
+        m = re.match(r'^\s*(\d+(?:\.\d+)+)\s+(.+)', line)
+        if m:
+            sec = m.group(1)
+            title = strip_toc_dots(m.group(2).strip())
+            if is_real_section_number(sec) and is_real_section_title(title):
+                sections.append((sec, title, i))
+            i += 1
+            continue
+
+        # (c) Section number alone, title on next line
+        m = re.match(r'^\s*(\d+(?:\.\d+)+)\s*$', line)
+        if m and i + 1 < len(lines):
+            sec = m.group(1)
+            next_line = strip_toc_dots(lines[i + 1].strip())
+            if is_real_section_number(sec) and is_real_section_title(next_line):
+                sections.append((sec, next_line, i))
                 i += 2
                 continue
 
-        match = re.match(r'^\s*(\d+(\.\d+)?)\s+(.+)', line)
-        if match:
-            sections.append((match.group(1), match.group(3).strip(), i))
-            i += 1
-            continue
-
         i += 1
 
+    # Deduplicate: TOC entries appear before real headings with the same
+    # section number; keep the LAST occurrence (real heading, biggest body).
+    dedup = {}
+    for sec, title, start in sections:
+        dedup[sec] = (sec, title, start)  # later overwrites earlier
+    sections = sorted(dedup.values(), key=lambda s: s[2])
+
     print(f"✅ Found {len(sections)} sections")
+
+    # Pre-compute the body end-line for every section BEFORE filtering, so
+    # that a --section filter doesn't cause a parent section to absorb the
+    # rest of the file.
+    section_end = {}
+    for idx in range(len(sections)):
+        sec, _t, start = sections[idx]
+        level = get_level(sec)
+        end = len(lines)
+        for j in range(idx + 1, len(sections)):
+            if get_level(sections[j][0]) <= level:
+                end = sections[j][2]
+                break
+        section_end[(sec, start)] = end
+
+    # Apply --section filter (prefix match on section number, e.g. "13.11" matches "13.11", "13.11.1", ...)
+    if SECTION_FILTER is not None:
+        before = len(sections)
+        sections = [s for s in sections if s[0] == SECTION_FILTER or s[0].startswith(SECTION_FILTER + ".")]
+        print(f"✅ Section filter '{SECTION_FILTER}': {before} -> {len(sections)} sections")
+        if not sections:
+            print("⚠️  No sections matched filter; nothing to do.")
+            return
+
+    if DRY_RUN:
+        print("\n[dry-run] Detected sections (no files will be written):")
+        for sec, title, start in sections[:200]:
+            abs_line = start + line_offset
+            print(f"  L{abs_line:>7}  §{sec:<12}  {title[:80]}")
+        if len(sections) > 200:
+            print(f"  ... ({len(sections) - 200} more)")
+        print(f"\n[dry-run] total sections: {len(sections)}")
+        return
 
     for d in [SUB_DIR, REG_DIR, MISC_DIR]:
         os.makedirs(d, exist_ok=True)
 
     reg_count = 0
+    sub_count = 0
+    skipped_garbage = 0
 
-    # ---------- 寫 subsystem + register ----------
+    # T2-1: build a section_index manifest as we go.
+    # Records every level-0..N section with its absolute line range so the
+    # AI can look up sections directly without grepping.
+    section_records = {}  # section_number -> dict
+    for sec, title, start in sections:
+        end = section_end.get((sec, start), len(lines))
+        section_records[sec] = {
+            "section": sec,
+            "title": title,
+            "level": get_level(sec),
+            "lines": [start + line_offset, end + line_offset - 1],
+            "file": None,         # filled in if a standalone file is emitted
+            "topics": [],         # filled in by topic-categorization later
+        }
+
+    # ---------- 寫 subsystem + register (T1-2 / T1-3) ----------
+    #
+    # T1-2: Subsystem body extends to the next section at the SAME OR HIGHER
+    #       level. So §13.11's body now absorbs §13.11.1, §13.11.2, §13.11.3,
+    #       etc., including their register tables -- and stops at §13.12.
+    # T1-3: Filename = <normalized_title>_<section_underscores>.md, so
+    #       collisions disappear. Sections whose normalized title is empty,
+    #       starts with a digit, or has <3 alpha chars are skipped (garbage).
     for idx in range(len(sections)):
         section, title, start = sections[idx]
-        end = sections[idx+1][2] if idx+1 < len(sections) else len(lines)
+        level = get_level(section)  # 0=Chapter, 1=X.Y, 2=X.Y.Z, ...
+
+        # Only emit standalone files for level-1 sections (X.Y).
+        # Deeper sub-sections are absorbed into their parent subsystem body.
+        if level != 1:
+            continue
+
+        # Body extends until the next sibling-or-higher section
+        # (pre-computed above so --section filter doesn't break boundaries).
+        end = section_end.get((section, start), len(lines))
 
         body = "".join(lines[start:end]).strip()
-
         if len(body) < 500:
             continue
 
-        category = classify(section, title)
-
-        filename = normalize(title)
+        # T1-3: build a safe, collision-free filename.
+        norm = normalize(title)
         for k, v in ALIAS.items():
             if k in title.lower():
-                filename = v
+                norm = v
+        alpha_chars = sum(c.isalpha() for c in norm)
+        if not norm or norm[0].isdigit() or alpha_chars < 3:
+            skipped_garbage += 1
+            continue
 
-        filename = filename[:60] + ".md"
+        sec_sfx = section.replace(".", "_")
+        filename = f"{norm[:60]}_{sec_sfx}.md"
+
+        category = classify(section, title)
 
         # subsystem
         if category == "subsystems":
             path = os.path.join(SUB_DIR, filename)
+            abs_start = start + line_offset
+            abs_end = end + line_offset - 1
 
             with open(path, "w", encoding="utf-8") as f:
                 f.write(f"# {title}\n\n")
-                f.write(f"Section: {section}\n\n")
+                f.write(f"Section: {section}\n")
+                f.write(f"Source: docs/source/IMX8MPRM.md:L{abs_start}-L{abs_end}\n\n")
 
                 keywords = extract_keywords(title, body)
                 if keywords:
@@ -266,29 +433,54 @@ def parse_and_extract():
 
                 f.write("## Raw Specification\n\n")
                 f.write(body)
+            sub_count += 1
+            # Record the emitted file path in the manifest
+            if section in section_records:
+                section_records[section]["file"] = f"subsystems/{filename}"
 
-        # register extract
+        # register extract (one file per detected register block inside body)
         blocks = body.split("\n\n")
-
         for i_b, block in enumerate(blocks):
             if is_register_block(block):
                 reg_file = filename.replace(".md", f"_reg_{i_b}.md")
                 reg_path = os.path.join(REG_DIR, reg_file)
-
                 with open(reg_path, "w", encoding="utf-8") as out:
                     out.write(block)
-
                 reg_count += 1
 
+    print(f"✅ Wrote {sub_count} subsystem files, {reg_count} register blocks "
+          f"(skipped {skipped_garbage} garbage titles)")
+
     create_index(sections)
-    create_topic_index(sections)
+    create_topic_index(sections, section_records)
+    create_section_index_json(section_records)
     create_driver_prompt()
     write_source_marker()
     create_copilot_instructions()
     create_search_rules_doc()
 
-    print(f"✅ Extracted {reg_count} register blocks")
     print("✅ ✅ ✅ ALL DONE")
+
+
+# ---------- section_index.json (T2-1) ----------
+def create_section_index_json(section_records):
+    """Write a machine-readable manifest of every detected section so an AI
+    can look up section -> (title, line range, output file, topics) directly."""
+    import json
+    # Tag each record with its categories using the existing CATEGORIES logic.
+    for rec in section_records.values():
+        rec["topics"] = categorize_multi(rec["title"])
+
+    out_path = os.path.join(BASE_DIR, "section_index.json")
+    payload = {
+        "source": "docs/source/IMX8MPRM.md",
+        "total_sections": len(section_records),
+        "sections": [section_records[k] for k in sorted(section_records.keys(),
+                                                       key=lambda s: [int(p) for p in s.split(".")])],
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"✅ section_index.json: {len(section_records)} sections -> {out_path}")
 
 # ---------- subsystem index (chapter-level, short fallback) ----------
 def create_index(sections):
@@ -318,46 +510,63 @@ def categorize_multi(title):
                 break
     return cats
 
-def create_topic_index(sections):
+def create_topic_index(sections, section_records=None):
     topic_dir = os.path.join(BASE_DIR, "topics")
     os.makedirs(topic_dir, exist_ok=True)
 
     by_cat = {cat: [] for cat in CATEGORIES}
     by_cat["misc"] = []
 
-    for sec, title, _ in sections:
-        if get_level(sec) > 1:
-            continue
-        cats = categorize_multi(title)
-        if not cats:
-            by_cat["misc"].append((sec, title))
-        else:
-            for c in cats:
-                by_cat[c].append((sec, title))
+    # T2-2: prefer the rich `section_records` (with line ranges + file paths)
+    # over the raw `sections` list. Only include level-1 sections, since only
+    # those produce standalone files now.
+    if section_records:
+        entries = [r for r in section_records.values() if r["level"] == 1]
+    else:
+        entries = None
+
+    if entries is not None:
+        for r in entries:
+            cats = categorize_multi(r["title"])
+            target = cats if cats else ["misc"]
+            for c in target:
+                by_cat.setdefault(c, []).append(r)
+    else:
+        # Legacy path: keep old behaviour if no records provided
+        for sec, title, _ in sections:
+            if get_level(sec) > 1:
+                continue
+            cats = categorize_multi(title)
+            target = cats if cats else ["misc"]
+            for c in target:
+                by_cat.setdefault(c, []).append({"section": sec, "title": title,
+                                                  "lines": None, "file": None})
 
     # main.md - topic dispatcher
     main_path = os.path.join(topic_dir, "main.md")
     with open(main_path, "w") as f:
         f.write("# Topic Index (main dispatcher)\n\n")
         f.write("Use this file FIRST. Match query keyword against the keyword list of each topic, then open `topics/<topic>.md`.\n\n")
+        f.write("For programmatic lookup of a specific section number, see `docs/section_index.json`.\n\n")
         for cat in sorted(by_cat.keys()):
             kws = CATEGORIES.get(cat, [cat])
             count = len(by_cat[cat])
             f.write(f"- **{cat}** ({count} entries) keywords: {', '.join(kws)} -> topics/{cat}.md\n")
 
     # per-category file
-    for cat, entries in by_cat.items():
+    for cat, recs in by_cat.items():
         path = os.path.join(topic_dir, f"{cat}.md")
         with open(path, "w") as f:
             f.write(f"# Topic: {cat}\n\n")
-            f.write(f"{len(entries)} entries.\n\n")
-            for sec, title in entries:
-                fname = normalize(title)
-                for k, v in ALIAS.items():
-                    if k in title.lower():
-                        fname = v
-                fname = fname[:60] + ".md"
-                f.write(f"- {title} ({sec}) -> subsystems/{fname}\n")
+            f.write(f"{len(recs)} entries.\n\n")
+            for r in recs:
+                sec = r["section"]
+                title = r["title"]
+                lines = r.get("lines")
+                file = r.get("file")
+                line_part = f" (L{lines[0]}-L{lines[1]})" if lines else ""
+                file_part = f" -> {file}" if file else ""
+                f.write(f"- §{sec} {title}{line_part}{file_part}\n")
 
     print(f"✅ topic index built: {len(by_cat)} topics, total entries (with multi-tag): {sum(len(v) for v in by_cat.values())}")
 
@@ -458,12 +667,13 @@ They were generated by `tools/ai_doc_parser/parse_datasheet.py`.
 
 ## Source of Truth (in priority order)
 1. `docs/topics/main.md`            -- topic dispatcher (open FIRST)
-2. `docs/topics/<topic>.md`         -- per-topic candidate lists
-3. `docs/subsystems/*.md`           -- per-subsystem specifications
-4. `docs/registers/*.md`            -- register field tables
-5. `docs/misc/*.md`                 -- everything else that survived parsing
-6. `docs/subsystems_index.md`       -- chapter-level fallback index
-7. `{src_rel}` via `fallback/lookup.py` -- catch-all for what `docs/` missed
+2. `docs/topics/<topic>.md`         -- per-topic candidate lists (each entry has section + line range + file)
+3. `docs/section_index.json`        -- machine-readable section lookup (section -> title, line range, file, topics)
+4. `docs/subsystems/*.md`           -- per-subsystem specifications (level-1 sections; absorbs all child sub-sections)
+5. `docs/registers/*.md`            -- register field tables
+6. `docs/misc/*.md`                 -- everything else that survived parsing
+7. `docs/subsystems_index.md`       -- chapter-level fallback index
+8. `{src_rel}` via `fallback/lookup.py` -- catch-all for what `docs/` missed
 
 ## Hard Rules
 - Do NOT guess.
@@ -614,12 +824,13 @@ higher tiers cannot answer.
 | # | Source | Purpose |
 |---|---|---|
 | 1 | `docs/topics/main.md` | Topic dispatcher — always opened FIRST |
-| 2 | `docs/topics/<topic>.md` | Per-topic candidate sub-file lists |
-| 3 | `docs/subsystems/*.md` | Per-subsystem specifications |
-| 4 | `docs/registers/*.md` | Register field tables (offset / bits) |
-| 5 | `docs/misc/*.md` | Sections that did not match any topic |
-| 6 | `docs/subsystems_index.md` | Chapter-level fallback index |
-| 7 | `{src_rel}` via `fallback/lookup.py` | Catch-all for what `docs/` missed |
+| 2 | `docs/topics/<topic>.md` | Per-topic candidates (entries carry section + line range + file) |
+| 3 | `docs/section_index.json` | Direct section -> (title, line range, file, topics) lookup |
+| 4 | `docs/subsystems/*.md` | Per-subsystem specifications (level-1 absorbs child sub-sections) |
+| 5 | `docs/registers/*.md` | Register field tables (offset / bits) |
+| 6 | `docs/misc/*.md` | Sections that did not match any topic |
+| 7 | `docs/subsystems_index.md` | Chapter-level fallback index |
+| 8 | `{src_rel}` via `fallback/lookup.py` | Catch-all for what `docs/` missed |
 
 ---
 
@@ -756,7 +967,35 @@ so the bench cannot drift.
 
 # ---------- main ----------
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        INPUT_FILE = resolve_input(sys.argv[1])
-        print(f"✅ Input resolved to: {INPUT_FILE}")
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Parse a datasheet markdown/text into docs/ subsystem files."
+    )
+    ap.add_argument("input", nargs="?", default=None,
+                    help="Input .pdf/.md/.txt (default: docs/source/IMX8MPRM.md if present, else IMX8MPRM.txt)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Detect sections and print a summary, do NOT write any output files.")
+    ap.add_argument("--section", metavar="X.Y",
+                    help="Only process sections whose number starts with this prefix (e.g. 13.11). Implies --dry-run unless --write is given.")
+    ap.add_argument("--range", nargs=2, type=int, metavar=("L_START", "L_END"),
+                    help="Only parse this 1-based inclusive line range of the source file.")
+    ap.add_argument("--write", action="store_true",
+                    help="When used with --section/--range, actually write output files instead of dry-run.")
+    args = ap.parse_args()
+
+    # Default input: prefer docs/source/IMX8MPRM.md if it exists, otherwise the legacy .txt
+    if args.input is None:
+        candidate_md = os.path.join(SRC_DIR, "IMX8MPRM.md")
+        args.input = candidate_md if os.path.exists(candidate_md) else DEFAULT_INPUT
+
+    INPUT_FILE = resolve_input(args.input)
+    print(f"✅ Input resolved to: {INPUT_FILE}")
+
+    SECTION_FILTER = args.section
+    LINE_RANGE = tuple(args.range) if args.range else None
+    # --section / --range default to dry-run unless --write is explicitly given
+    DRY_RUN = args.dry_run or ((args.section or args.range) and not args.write)
+    if DRY_RUN:
+        print("ℹ️  Dry-run mode: no files will be written.")
+
     parse_and_extract()
