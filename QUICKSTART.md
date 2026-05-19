@@ -41,7 +41,7 @@ git clone https://github.com/MarkChangTodu/ai_doc_parser.git tools/ai_doc_parser
 | 步驟 | 動作 | 產出 |
 |---|---|---|
 | 1/3 | `convert/pdf_to_md.py` 用 vendored markitdown 轉 PDF | `docs/source/IMX8MPRM.md`（mtime cache，第二次會 skip） |
-| 1/3 | `parse_datasheet.py` 切 sections / 拆 21 個主題 / 抽 register blocks | `docs/topics/`, `docs/subsystems/`, `docs/registers/` |
+| 1/3 | `parse_datasheet.py` 切 sections / 拆 21 個主題 / 抽 register blocks / 寫 section_index.json | `docs/topics/`, `docs/subsystems/`, `docs/registers/`, `docs/section_index.json` |
 | 1/3 | 寫 fallback marker + Copilot 規則 | `docs/.source`, `.github/copilot-instructions.md` |
 | 2/3 | 顯示 fallback source 路徑 | — |
 | 3/3 | 跑 bench 對照（DB vs 單檔 MD） | stdout 表格 |
@@ -94,6 +94,11 @@ AI_DOC_NO_BENCH=1 ./tools/ai_doc_parser/pipeline.sh IMX8MPRM.pdf
 
 # 只跑 parse，不跑 pipeline 包裝
 python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.pdf
+
+# 增量迭代：只重切某個 section / 行範圍 / 先 dry-run 看寫什麼
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md --section 13.11 --dry-run
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md --section 13.11 --write
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md --range 239795 241153 --write
 
 # 只跑 bench（對既有 docs/）
 python3 tools/ai_doc_parser/bench/bench_md_vs_db.py \

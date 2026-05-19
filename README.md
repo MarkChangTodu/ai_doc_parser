@@ -17,6 +17,7 @@
 | 子系統 spec 切割 | `docs/subsystems/*.md` |
 | Register 區塊抽取 | `docs/registers/*.md` |
 | 其他段落 | `docs/misc/*.md` |
+| **Section index (JSON)** | `docs/section_index.json` |
 | Chapter-level 索引 (fallback) | `docs/subsystems_index.md` |
 | **Topic dispatcher (主索引)** | `docs/topics/main.md` |
 | 主題分類索引 (display / camera / dma / ...) | `docs/topics/<topic>.md` |
@@ -72,6 +73,21 @@ python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md    # 已切好的 MD
 python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.txt   # 舊流程相容
 ```
 
+### 3.2.1 增量 / 除錯模式
+
+Parser 支援快速迭代用 CLI flags（不會覆寫其他 section）：
+
+```bash
+# 只列出會產出什麼，不寫檔
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md --dry-run
+
+# 只重切某個 section（其他不動）
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md --section 13.11 --write
+
+# 只處理某行範圍
+python3 tools/ai_doc_parser/parse_datasheet.py IMX8MPRM.md --range 239795 241153 --write
+```
+
 ### 3.3 只做 PDF → MD（不切割）
 
 ```bash
@@ -105,6 +121,7 @@ zephyrproject/
 └── docs/
     ├── .source                   # 原始 .md 絕對路徑 (fallback/lookup.py 讀)
     ├── driver_prompt.md          # 查詢模板
+    ├── section_index.json        # ★ 全部 section 機器可讀索引 (section→title/line/file/topics)
     ├── subsystems_index.md       # Chapter-level fallback 索引
     ├── source/
     │   └── IMX8MPRM.md           # markitdown 轉出的原文 (catch-all fallback 來源)
@@ -117,9 +134,10 @@ zephyrproject/
     │   ├── mipi.md
     │   └── ...
     ├── subsystems/
-    │   ├── hdmi.md
-    │   ├── lcdif.md
-    │   └── ...
+    │   ├── hdmi_tx_controller_13_9.md
+    │   ├── lcdif_13_3.md
+    │   └── ...                   # 檔名: {normalized_title[:60]}_{section}.md
+    │                             # 每檔頭部含 `Source: docs/source/IMX8MPRM.md:L<a>-L<b>`
     ├── registers/
     │   ├── hdmi_reg_3.md
     │   └── ...
@@ -186,10 +204,19 @@ CATEGORIES = {
 - `pypdf`：純 Python，部分表格與欄位會錯位
 - **掃描型 PDF（圖片型）兩者都無法處理** — 需先做 OCR（如 `ocrmypdf`）
 
-### 7.3 Section 偵測 regex 是啟發式的
-- 目前用 `^\s*\d+(\.\d+)?\s+(.+)` 抓 section 編號
-- **副作用：** 表格、清單、頁碼有時會被誤判為 section（PDF 比 TXT 嚴重）
-- 若 `subsystems_index.md` 有大量雜訊，調整 `parse_and_extract()` 內的 regex 與長度過濾（`if len(body) < 500: continue`）
+### 7.3 Section 偵測規則
+
+Parser 用三個嚴格 pattern 抓 section（三段式 `X.Y.Z`、兩段式 `X.Y`、帶 `Chapter` 前綴），每筆都過 `is_real_section_number()` + `is_real_section_title()` validators：
+
+- 至少要有一個 dot（拒絕純頁碼／年份／版本號）
+- Title 至少 3 個英文字母（拒絕表格 cell、清單編號）
+- `NOISE_TITLES` 黑名單拒絕「Table of Contents」「i.MX 8M Plus Applications Processor」等 PDF 雜訊
+- `strip_toc_dots()` 去掉目錄式 `....... 1234` 點線
+- 同一 section number 出現第二次（running header）自動去重
+
+Level-1 section 寫成獨立 subsystem 檔，body extent 延伸到「下一個 sibling-or-higher」section，不會被自己的子節截斷（修正之前 §13.11 被 §13.11.1 截斷的 bug）。檔名 `{normalized_title[:60]}_{section_suffix}.md`，避免標題碎裂造成衝突。
+
+若 PDF 仍有偵測不到的 section（標題被切碎成多行），用 `--section X.Y --dry-run` 確認偵測結果，必要時調整 `NOISE_TITLES` 或 validator。
 
 ### 7.4 Topic 分類是關鍵字啟發式
 - `CATEGORIES` 內的關鍵字用 substring 比對（lowercase）
